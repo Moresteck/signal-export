@@ -4,10 +4,14 @@ import hashlib
 import hmac
 import json
 import shutil
+import ssl
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 from Crypto.Cipher import AES
+from Crypto.Protocol.KDF import HKDF
+from Crypto.Hash import SHA256
 from sqlcipher3 import dbapi2
 from typer import colors, secho
 
@@ -20,7 +24,28 @@ MAC_KEY_SIZE = 32
 MAC_SIZE = hashlib.sha256().digest_size
 
 
-def decrypt_attachment(att: dict[str, str], src_path: Path, dst_path: Path, detect_file_type: bool = False) -> None:
+def derive_key(pack_key):
+    hkdf = HKDF(
+        base64.b64decode(pack_key),
+        512,
+        None,
+        SHA256,
+        1,
+        b"Sticker Pack"
+    )
+
+    aes_key = hkdf[0:32]
+    hmac_key = hkdf[32:64]
+
+    return aes_key, hmac_key
+
+
+def decrypt_remote_sticker(pack_key: str, data: bytearray, dst_path: Path):
+    cipher, mac = derive_key(pack_key)
+    decrypt(cipher, mac, data, dst_path, None, True, False)
+
+
+def decrypt_attachment(att: dict[str, str], src_path: Path, dst_path: Path, detect_file_type: bool = False, validate_size: bool = True) -> None:
     """Decrypt attachment and save to `dst_path`.
 
     Code adapted from:
@@ -45,6 +70,16 @@ def decrypt_attachment(att: dict[str, str], src_path: Path, dst_path: Path, dete
     cipher_key = keys[:CIPHER_KEY_SIZE]
     mac_key = keys[CIPHER_KEY_SIZE:]
 
+    decrypt(cipher_key, mac_key, data, dst_path, int(att["size"]), detect_file_type, validate_size)
+
+
+def decrypt(cipher_key, mac_key, data: bytearray, dst_path: Path, size: int = None, detect_file_type: bool = False, validate_size: bool = True) -> None:
+    """Decrypt attachment and save to `dst_path`.
+
+    Code adapted from:
+        https://github.com/tbvdm/sigtop
+    """
+
     if len(data) < IV_SIZE + MAC_SIZE:
         raise ValueError("Attachment data too short")
 
@@ -67,8 +102,11 @@ def decrypt_attachment(att: dict[str, str], src_path: Path, dst_path: Path, dete
     except Exception as e:
         raise ValueError(f"Decryption failed: {str(e)}")
 
-    if len(decrypted_data) < int(att["size"]):
-        raise ValueError("Invalid attachment data length")
+    if validate_size:
+        if len(decrypted_data) < size:
+            raise ValueError("Invalid attachment data length")
+
+        decrypted_data = decrypted_data[: size]
 
     if detect_file_type:
         dst_path = str(dst_path)
@@ -79,9 +117,8 @@ def decrypt_attachment(att: dict[str, str], src_path: Path, dst_path: Path, dete
 
         dst_path += "." + ext
 
-    data_decrypted = decrypted_data[: att["size"]]
     with open(dst_path, "wb") as fp:
-        fp.write(data_decrypted)
+        fp.write(decrypted_data)
 
 
 def get_attachments_from_db(
@@ -323,6 +360,7 @@ def check_stickers_existence(
     convos: models.Convos,
     contacts: models.Contacts,
     dest: Path,
+    download_missing: bool,
 ) -> None:
     for key, messages in convos.items():
         name = contacts[key].name
@@ -338,15 +376,60 @@ def check_stickers_existence(
                     msg.sticker["packKey"],
                     msg.sticker["emoji"],
                 )
+
+                date = (
+                    datetime.fromtimestamp(msg.get_ts() / 1000)
+                    .isoformat(timespec="milliseconds")
+                )
+
                 if m_sticker.get_path(dest):
                     msg.sticker["extension"] = m_sticker.extension
+                elif download_missing:
+                    downloaded = download_sticker(m_sticker.id, m_sticker.packId, m_sticker.packKey, dest)
+
+                    if downloaded and (sticker_path := m_sticker.get_path(dest)):
+                        msg.sticker["extension"] = m_sticker.extension
+                        log(f"\t\tDownloaded missing sticker: {sticker_path}", fg=colors.GREEN)
+                    else:
+                        secho(
+                            f"Not found: sticker {m_sticker.id} from pack '{m_sticker.packId}' used in conversation '{name}' at {date}, skipping",
+                            fg=colors.MAGENTA,
+                        )
+                        msg.sticker["extension"] = "unknown"
                 else:
-                    date = (
-                        datetime.fromtimestamp(msg.get_ts() / 1000)
-                        .isoformat(timespec="milliseconds")
-                    )
                     secho(
                         f"Not found: sticker {m_sticker.id} from pack '{m_sticker.packId}' used in conversation '{name}' at {date}, skipping",
                         fg=colors.MAGENTA,
                     )
                     msg.sticker["extension"] = "unknown"
+
+
+def download_sticker(sticker_id: str, pack_id: str, pack_key: str, dest: Path) -> None:
+    sticker_url = f"https://cdn.signal.org/stickers/{pack_id}/full/{sticker_id}"
+
+    # NOTE: monitor 'cdn.signal.org' for cert updates - their certs usually last 13 months
+    context = ssl.create_default_context(cafile='sigexport/cdn-signal-org-chain.pem');
+
+    sticker_request = urllib.request.urlopen(sticker_url, context=context)
+    status_response = int(sticker_request.status)
+
+    if status_response == 403: # CDN returns 403 instead of 404
+        secho(f"Sticker '{sticker_id}' from pack '{pack_id}' no longer exists on Signal CDN", fg=colors.RED)
+        return False
+    if status_response not in range(200, 300):
+        secho(f"Failed downloading sticker '{sticker_id}' from pack '{pack_id}': {sticker_request.status} {sticker_request.reason}", fg=colors.RED)
+        return False
+
+    sticker_encrypted = sticker_request.read()
+
+    sticker_dest = Path(dest) / "exported_stickers" / pack_id
+    sticker_dest.mkdir(exist_ok=True, parents=True)
+    sticker_dest = Path(sticker_dest) / sticker_id
+
+    try:
+        decrypt_remote_sticker(pack_key, sticker_encrypted, sticker_dest)
+    except ValueError as e:
+        secho(f"Failed downloading sticker '{sticker_id}' from pack '{pack_id}': {e}", fg=colors.RED)
+        return False
+
+    return True
