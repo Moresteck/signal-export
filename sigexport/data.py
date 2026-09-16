@@ -3,24 +3,20 @@
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from sqlcipher3 import dbapi2
 from typer import Exit, colors, secho
 
-from Crypto.Cipher import AES
-from sqlcipher3 import dbapi2
-
-from sigexport import crypto, models
+from sigexport import crypto, models, utils
 from sigexport.logging import log
 
 
-def _call_history(jsonLoaded: dict, call_directions: dict[str, dict]) -> dict | None:
+def _call_history(json_loaded: dict, call_directions: dict[str, dict]) -> dict | None:
     """Build a call_history dict by combining legacy JSON and callsHistory data."""
-    legacy = jsonLoaded.get("call_history") or jsonLoaded.get("callHistoryDetails")
+    legacy = json_loaded.get("call_history") or json_loaded.get("callHistoryDetails")
     call_row = None
 
-    call_id = jsonLoaded.get("callId")
+    call_id = json_loaded.get("callId")
     if call_id is not None:
         call_row = call_directions.get(str(call_id))
 
@@ -70,9 +66,10 @@ def fetch_data(
     chats: str,
     include_empty: bool,
     include_disappearing: bool,
-    start_date: Optional[datetime] = None,
-    end_date: Optional[datetime] = None,
-) -> tuple[models.Convos, models.Contacts, Optional[models.Contact]]:
+    start_date: datetime | None = None,
+    end_date: datetime | None = None,
+    nicknames: bool = False,
+) -> tuple[models.Convos, models.Contacts, models.Contact | None]:
     """Load SQLite data into dicts.
     :returns: a tuple of:
         all conversations,
@@ -88,8 +85,9 @@ def fetch_data(
 
     call_directions = _load_call_directions(c)
 
-    query = "SELECT type, id, serviceId, e164, name, profileName, members FROM conversations"
+    query = "SELECT type, id, serviceId, e164, name, profileName, members, json FROM conversations"
     c.execute(query)
+    nickname_count = 0
     for result in c:
         log(f"\tLoading SQL results for: {result[4]}, aka {result[5]}")
         members = []
@@ -97,20 +95,41 @@ def fetch_data(
             members = result[6].split(" ")
         is_group = result[0] == "group"
         cid = result[1]
+
+        # Nicknames live in the conversation JSON, not a dedicated column.
+        nickname = None
+        if nicknames and result[7]:
+            try:
+                conv_json = json.loads(result[7])
+            except (TypeError, ValueError):
+                conv_json = {}
+            nickname = utils.format_nickname(
+                conv_json.get("nicknameGivenName"),
+                conv_json.get("nicknameFamilyName"),
+            )
+            if nickname:
+                nickname_count += 1
+
         contact = models.Contact(
             id=cid,
             serviceId=result[2],
-            name=result[4],
+            name=utils.display_name(result[4], result[5], nickname),
             number=result[3],
             profile_name=result[5],
             members=members,
             is_group=is_group,
         )
-        if contact.name is None:
-            contact.name = contact.profile_name
         contacts[cid] = contact
-        if not chats or (result[4] in chats_list or result[5] in chats_list):
+
+        match_names = [result[4], result[5], nickname]
+        if not chats or any(n and n in chats_list for n in match_names):
             convos[cid] = []
+
+    if nicknames and nickname_count == 0:
+        secho(
+            "Note: --nicknames was set but no nicknames were found in this Signal DB.",
+            fg=colors.YELLOW,
+        )
 
     # Check which columns exist (older DB schemas may be missing some)
     c.execute("PRAGMA table_info(messages)")
@@ -183,6 +202,8 @@ def fetch_data(
                 reactions=jsonLoaded.get("reactions", []),
                 sticker=jsonLoaded.get("sticker"),
                 quote=jsonLoaded.get("quote"),
+                deleted=bool(jsonLoaded.get("deletedForEveryone")),
+                has_visual_media=bool(jsonLoaded.get("hasVisualMediaAttachments")),
             )
 
             convos[cid].append(con)
@@ -193,7 +214,7 @@ def fetch_data(
     owner_row = c.execute("select ourServiceId from sessions").fetchone()
     owner_id = owner_row[0] if owner_row is not None else None
     contact_by_service_id: models.Contacts = {c.serviceId: c for c in contacts.values()}
-    owner_contact = contact_by_service_id[owner_id] if owner_id else None
+    owner_contact = contact_by_service_id.get(owner_id) if owner_id else None
 
     return convos, contacts, owner_contact
 
@@ -202,6 +223,8 @@ def get_signal_database(
     src: Path,
     password: Optional[str],
     key: Optional[str],
+    password: str | None,
+    key: str | None,
 ) -> dbapi2.Cursor:
     db_file = src / "sql" / "db.sqlite"
 

@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+JsonDict = dict[str, Any]
+
 
 @dataclass
 class RawMessage:
@@ -34,6 +36,9 @@ class RawMessage:
     sticker: dict[str, Any] | None
     quote: dict[str, Any] | None
 
+    deleted: bool = False
+    has_visual_media: bool = False
+
     def get_ts(self: RawMessage) -> int:
         if self.sent_at and self.server_timestamp:
             if self.server_timestamp < self.sent_at:
@@ -55,14 +60,26 @@ class Sticker:
     emoji: str
     extension: str | None = None
 
-    def get_path(self: Sticker, exportDest: Path = None) -> str | None:
-        if not exportDest:
+    @property
+    def label(self: Sticker) -> str:
+        """Text stand-in for the sticker, as not every sticker has an emoji."""
+        return self.emoji or "sticker"
+
+    def get_path(self: Sticker, export_dest: Path | None = None) -> str | None:
+        if not export_dest:
             if self.extension:
-                return "exported_stickers/" + self.packId + "/" + self.id + "." + self.extension
+                return (
+                    "exported_stickers/"
+                    + self.packId
+                    + "/"
+                    + self.id
+                    + "."
+                    + self.extension
+                )
             else:
                 return None
 
-        pack_path = Path(exportDest) / "exported_stickers" / self.packId
+        pack_path = Path(export_dest) / "exported_stickers" / self.packId
         if not pack_path.is_dir():
             return None
 
@@ -77,11 +94,17 @@ class Sticker:
 class Contact:
     id: str
     serviceId: str
-    name: str
+    name: str | None
     number: str
     profile_name: str
     is_group: bool
     members: list[str] | None
+    # Human-readable name for display in the conversation (sender labels,
+    # reactions, HTML title). Unlike `name`, it has no folder-uniqueness
+    # suffix, so two "Alice"s live in Alice/ and Alice2/ but both read "Alice".
+    display: str | None = None
+    # the db owner (you): shown as "Me", so reactions don't read "Note to Self"
+    is_owner: bool = False
 
 
 Contacts = dict[str, Contact]
@@ -134,6 +157,9 @@ def is_video(p: str) -> bool:
 class Attachment:
     name: str
     path: str
+    # set when the attachment existed but wasn't included in the export
+    # (e.g. --no-attachments, missing source file, failed decrypt)
+    missing_kind: str | None = None
 
 
 @dataclass
@@ -145,9 +171,14 @@ class Message:
     sticker: Sticker | None
     reactions: list[Reaction]
     attachments: list[Attachment]
+    deleted: bool = False
+    call: bool = False
+    missed: bool = False
 
     def to_md(self: Message) -> str:
         date_str = self.date.strftime("%Y-%m-%d %H:%M:%S")
+        if self.deleted:
+            return f"[{date_str}] {self.sender}: (This message was deleted)\n"
         body = self.body
 
         if len(self.reactions) > 0:
@@ -157,11 +188,14 @@ class Message:
         if self.sticker:
             sticker_path = self.sticker.get_path()
             if sticker_path:
-                body += f"[{self.sticker.emoji}](../{sticker_path})  "
+                body += f"[{self.sticker.label}](../{sticker_path})  "
             else:
-                body = body + "\n(( " + self.sticker.emoji + " ))"
+                body = body + "\n(( " + self.sticker.label + " ))"
 
         for att in self.attachments:
+            if att.missing_kind is not None:
+                body += f"({att.missing_kind} not exported)  "
+                continue
             if is_image(att.path):
                 body += "!"
             body += f"[{att.name}](./{att.path})  "
@@ -172,7 +206,7 @@ class Message:
         date = self.date.replace(second=0, microsecond=0)
         return (date, self.sender, self.body.replace("\n", "").replace(">", "").strip())
 
-    def dict(self: Message) -> dict:
+    def dict(self: Message) -> JsonDict:
         msg_dict = asdict(self)
         msg_dict["date"] = msg_dict["date"].isoformat()
         return msg_dict
@@ -207,7 +241,11 @@ class MergeMessage:
 
         p_stickers = r"\n\(\( (.*) \)\)"
         stickers = re.findall(p_stickers, self.body)
-        sticker = stickers[0] if stickers else ""
+        sticker = (
+            Sticker(id="", packId="", packKey="", emoji=stickers[0])
+            if stickers
+            else None
+        )
         body = re.sub(p_stickers, "", body)
 
         p_quote = re.compile(r"\n> (.*)$")

@@ -9,6 +9,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+import filetype
 from Crypto.Cipher import AES
 from Crypto.Protocol.KDF import HKDF
 from Crypto.Hash import SHA256
@@ -45,7 +46,24 @@ def decrypt_remote_sticker(pack_key: str, data: bytearray, dst_path: Path):
     decrypt(cipher, mac, data, dst_path, None, True, False)
 
 
-def decrypt_attachment(att: dict[str, str], src_path: Path, dst_path: Path, detect_file_type: bool = False, validate_size: bool = True) -> None:
+def _json_default(obj: object) -> str:
+    """Fallback JSON serializer for values sqlite returns as bytes.
+
+    Signal stores some sticker-pack columns (e.g. ``storageID`` and
+    ``storageUnknownFields``) as BLOBs, which ``json.dumps`` cannot encode.
+    Represent them as base64 so the sticker export succeeds instead of raising
+    ``TypeError: Object of type bytes is not JSON serializable``.
+    """
+    if isinstance(obj, bytes):
+        return base64.b64encode(obj).decode("ascii")
+    raise TypeError(
+        f"Object of type {type(obj).__name__} is not JSON serializable"
+    )
+
+
+def decrypt_attachment(
+    att: dict[str, str], src_path: Path, dst_path: Path, detect_file_type: bool = False, validate_size: bool = True
+) -> None:
     """Decrypt attachment and save to `dst_path`.
 
     Code adapted from:
@@ -108,14 +126,16 @@ def decrypt(cipher_key, mac_key, data: bytearray, dst_path: Path, size: int = No
 
         decrypted_data = decrypted_data[: size]
 
+    dst_path_str = str(dst_path)
     if detect_file_type:
-        dst_path = str(dst_path)
         try:
             ext = filetype.guess_extension(decrypted_data)
         except TypeError:
             raise ValueError("Unsupported attachment file type")
+        if ext is None:
+            raise ValueError("Could not detect attachment file type")
 
-        dst_path += "." + ext
+        dst_path_str += "." + ext
 
     with open(dst_path, "wb") as fp:
         fp.write(decrypted_data)
@@ -223,6 +243,11 @@ def copy_attachments(
                         .replace(":", "-")
                         .replace("|", "-")
                         .replace("*", "_")
+                        .replace("\\", "-")
+                        .replace("<", "_")
+                        .replace(">", "_")
+                        .replace('"', "_")
+                        .replace("?", "_")
                     )
                     # account for erroneous backslash in path
                     try:
@@ -351,7 +376,7 @@ def copy_stickers(
             sticker_packs[pack_id]["stickers"].append(sticker)
         js_path = pck_path / "data.json"
         js_f = js_path.open("a", encoding="utf-8")
-        js_str = json.dumps(sticker_packs[pack_id])
+        js_str = json.dumps(sticker_packs[pack_id], default=_json_default)
         if js_f:
             print(js_str, file=js_f)
 
@@ -374,12 +399,11 @@ def check_stickers_existence(
                     str(msg.sticker["stickerId"]),
                     msg.sticker["packId"],
                     msg.sticker["packKey"],
-                    msg.sticker["emoji"],
+                    msg.sticker.get("emoji", ""),
                 )
 
-                date = (
-                    datetime.fromtimestamp(msg.get_ts() / 1000)
-                    .isoformat(timespec="milliseconds")
+                date = datetime.fromtimestamp(msg.get_ts() / 1000).isoformat(
+                    timespec="milliseconds"
                 )
 
                 if m_sticker.get_path(dest):
@@ -401,7 +425,7 @@ def check_stickers_existence(
                         f"Not found: sticker {m_sticker.id} from pack '{m_sticker.packId}' used in conversation '{name}' at {date}, skipping",
                         fg=colors.MAGENTA,
                     )
-                    msg.sticker["extension"] = "unknown"
+                    msg.sticker["extension"] = None
 
 
 def download_sticker(sticker_id: str, pack_id: str, pack_key: str, dest: Path) -> None:

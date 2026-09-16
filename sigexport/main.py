@@ -1,18 +1,15 @@
 """Main script for sigexport."""
 
-import os
-import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from typer import Argument, Context, Exit, Option, colors, run, secho
 
 from sigexport import create, data, files, html, logging, merge, utils
 from sigexport.export_channel_metadata import export_channel_metadata
 
-OptionalPath = Optional[Path]
-OptionalStr = Optional[str]
+OptionalPath = Path | None
+OptionalStr = str | None
 
 
 def main(
@@ -53,12 +50,12 @@ def main(
         "--include-disappearing",
         help="Whether to include disappearing messages",
     ),
-    start_date: Optional[str] = Option(
+    start_date: str | None = Option(
         None,
         "--start",
         help="Start date as a ISO-8601 formatted string (e.g., 2025-01-15T12:30:00+02:00)",
     ),
-    end_date: Optional[str] = Option(
+    end_date: str | None = Option(
         None,
         "--end",
         help="End date as a ISO-8601 formatted string (e.g., 2025-03-15T12:30:00+02:00)",
@@ -68,6 +65,12 @@ def main(
         "--overwrite/--no-overwrite",
         help="Overwrite contents of output directory if it exists",
     ),
+    yes: bool = Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirmation prompt when overwriting",
+    ),
     verbose: bool = Option(False, "--verbose", "-v"),
     channel_members_only: bool = Option(
         False,
@@ -76,6 +79,12 @@ def main(
     ),
     attachments: bool = Option(
         True, "--attachments/--no-attachments", help="Whether to copy attachments"
+    ),
+    nicknames: bool = Option(
+        False,
+        "--nicknames/--no-nicknames",
+        help="Use Signal nicknames (where set) for names and folders, "
+        "instead of profile names",
     ),
     _: bool = Option(False, "--version", callback=utils.version_callback),
 ) -> None:
@@ -129,6 +138,7 @@ def main(
         include_disappearing=include_disappearing,
         start_date=parsed_start_date,
         end_date=parsed_end_date,
+        nicknames=nicknames,
     )
 
     if list_chats:
@@ -142,17 +152,28 @@ def main(
         )
         raise Exit()
 
+    if not convos:
+        secho("No chats to export, didn't do anything!", fg=colors.RED)
+        raise Exit()
+
     dest = Path(dest).expanduser()
     if not dest.is_dir():
         dest.mkdir(parents=True, exist_ok=True)
     elif overwrite:
-        shutil.rmtree(dest)
+        utils.safe_delete(dest, yes=yes)
         dest.mkdir(parents=True, exist_ok=True)
     else:
         secho(
             f"Output folder '{dest}' already exists, didn't do anything!", fg=colors.RED
         )
         raise Exit()
+
+    # The conversation with your own account is Signal's "Note to Self"; it
+    # usually has no name and would otherwise land in the shared "None" folder.
+    # Mark it so your own reactions read "Me" rather than the folder name.
+    if owner is not None:
+        owner.name = "Note to Self"
+        owner.is_owner = True
 
     contacts = utils.fix_names(contacts)
 
@@ -190,6 +211,9 @@ def main(
         if not name:
             name = "None"
 
+        # `name` is the (unique) folder; `title` is the human name for display
+        title = contacts[key].display or name
+
         (dest / name).mkdir(parents=True, exist_ok=True)
         md_path = dest / name / "chat.md"
         js_path = dest / name / "data.json"
@@ -210,7 +234,10 @@ def main(
                     print(msg.dict_str(), file=js_f)
             if ht_f:
                 ht = html.create_html(
-                    name=name, messages=messages, msgs_per_page=paginate
+                    name=title,
+                    messages=messages,
+                    msgs_per_page=paginate,
+                    media_dir=dest / name,
                 )
                 print(ht, file=ht_f)
         finally:

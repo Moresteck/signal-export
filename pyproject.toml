@@ -1,7 +1,7 @@
 [tool.poe.tasks]
 fmt = "ruff format"
 lint = "ruff check --fix"
-check = "pyright"
+check = "ty check ."
 test = "pytest"
 
 all = [
@@ -16,7 +16,7 @@ name = "signal-export"
 description = "Export Signal conversations to Markdown and HTML"
 readme = "README.md"
 license = {text = "MIT License"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 keywords = ["backup", "chat", "export"]
 
 authors = [
@@ -34,8 +34,8 @@ classifiers = [
 dependencies = [
     "beautifulsoup4~=4.11",
     "emoji~=2.0",
-    "Markdown~=3.4",
-    "typer>=0.12.1",
+    "Markdown>=3.8.1,<4",
+    "typer>=0.16.0",
     "pycryptodome~=3.20",
     "sqlcipher3-wheels>=0.5.4",
     "filetype>=1.2.0",
@@ -45,9 +45,9 @@ dependencies = [
 dev = [
     "poethepoet",
     "ruff",
-    "pyright",
     "pytest",
     "pytest-cov",
+    "ty",
     "types-Markdown",
     "types-emoji",
 ]
@@ -70,7 +70,7 @@ includes = ["sigexport/"]
 source = "scm"
 
 [tool.ruff]
-target-version = "py39"
+target-version = "py310"
 exclude = ["tests"]
 
 [tool.ruff.lint]
@@ -97,13 +97,3 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["sigexport"]
-
-[tool.pyright]
-venvPath = "."
-venv = ".venv"
-include = ["sigexport", "tests"]
-reportMissingImports = true
-reportMissingParameterType = true
-reportUnnecessaryTypeIgnoreComment = true
-reportDeprecated = true
-pythonVersion = "3.9"
